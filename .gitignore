@@ -1,0 +1,15 @@
+# Bỏ qua toàn bộ thư mục chứa dataset
+data/
+/content/data/
+dataset_manifest.json
+
+# Bỏ qua các file cache và model weights nặng
+*.pth
+*.pt
+*cache*.json
+__pycache__/
+
+# Bỏ qua môi trường ảo (nếu có dùng ở máy local)
+venv/
+.env
+/dataset
