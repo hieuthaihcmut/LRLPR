@@ -6,39 +6,61 @@ import numpy as np
 from fastapi import FastAPI, UploadFile, File
 from typing import List
 import uvicorn
+from contextlib import asynccontextmanager
 
 from src.models import TinyCornerNet, CornerPredictor, ResTranOCR_Robust
-from src.data.preprocess import warp_plate
+from src.data.preprocess import warp_plate, apply_layout_pattern
 from src.utils.text_utils import ctc_decode, vocab_size, itos
 
-app = FastAPI(title="LPR Multi-frame OCR API")
-
-# --- KHỞI TẠO BIẾN GLOBAL ĐỂ LOAD MODEL 1 LẦN DUY NHẤT KHI START SERVER ---
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Biến toàn cục
 c_pred = None
 o_model = None
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-@app.on_event("startup")
-def load_models():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     global c_pred, o_model
-    with open("configs/default.yaml", "r") as f:
+    with open("configs/default.yaml", "r", encoding="utf-8") as f: 
         config = yaml.safe_load(f)
     
-    # Load Corner Net
+    print("\n⏳ Đang nạp mô hình...")
+    
+    # 1. NẠP MÔ HÌNH NẮN GÓC (CORNER NET)
     c_model = TinyCornerNet().to(device)
-    c_model.load_state_dict(torch.load(config['project']['corner_ckpt'], map_location=device))
+    corner_path = config['project']['corner_ckpt']
+    
+    if os.path.exists(corner_path):
+        c_model.load_state_dict(torch.load(corner_path, map_location=device))
+        print(f"✅ [1/2] Đã nạp CornerNet từ: {corner_path}")
+    else:
+        print(f"❌ CẢNH BÁO: KHÔNG TÌM THẤY {corner_path}!")
+        print("   -> AI sẽ bị 'mù' mạng nắn góc, cắt ảnh sai và đọc ra chuỗi rỗng!")
+        
     c_pred = CornerPredictor(c_model, device)
     
-    # Load OCR Net
-    o_model = ResTranOCR_Robust(vocab_size).to(device)
-    best_ocr_path = os.path.join(config['project']['work_dir'], "best_ocr_model.pth")
-    o_model.load_state_dict(torch.load(best_ocr_path, map_location=device))
+    # 2. NẠP MÔ HÌNH OCR (BẢN LSTM - feat=512)
+    o_model = ResTranOCR_Robust(vocab_size, feat=512).to(device)
+    best_path = os.path.join(config['project']['work_dir'], "best_ocr_model.pth")
+    
+    if os.path.exists(best_path):
+        o_model.load_state_dict(torch.load(best_path, map_location=device))
+        print(f"✅ [2/2] Đã nạp OCR Model từ: {best_path}")
+    else:
+        print(f"❌ CẢNH BÁO: KHÔNG TÌM THẤY {best_path}!")
+        
     o_model.eval()
-    print("✅ Đã load models thành công!")
+    print("🚀 HỆ THỐNG API ĐÃ SẴN SÀNG NHẬN ẢNH!\n")
+    
+    yield # Trả quyền điều khiển cho FastAPI chạy
+    
+    print("🛑 Đang tắt hệ thống...")
+
+# Khởi tạo App với lifespan mới
+app = FastAPI(title="LPR OCR System API", lifespan=lifespan)
 
 @app.post("/predict")
-async def predict_plate(files: List[UploadFile] = File(...)):
-    """ Nhận vào danh sách ảnh (từ 1 đến 5 frames) và trả về biển số xe """
+async def predict_plate(layout: str = "Mercosur", files: List[UploadFile] = File(...)):
+    """API Nhận 1 đến 5 ảnh (các frame của 1 xe) và trả về biển số"""
     frames = []
     
     for file in files:
@@ -50,18 +72,29 @@ async def predict_plate(files: List[UploadFile] = File(...)):
             frames.append(torch.zeros(3, 32, 128))
             continue
             
-        # Tiền xử lý giống hệt file notebook gốc
+        # Nắn góc và tiền xử lý
         c = c_pred.predict_corners(img)
         rgb = (cv2.resize(warp_plate(img, c, 32), (128, 32))[:,:,::-1].astype(np.float32)/255.0 - 0.5)/0.5
+        
+        # 🕵️ LƯU ẢNH DEBUG ĐỂ BẮT BỆNH
+        debug_img = (rgb * 0.5 + 0.5) * 255.0
+        safe_filename = "".join(c for c in file.filename if c.isalnum() or c in "._- ")
+        cv2.imwrite(f"debug_{safe_filename}.jpg", debug_img[:,:,::-1])
+        
         frames.append(torch.from_numpy(rgb).permute(2,0,1))
         
-    # Đệm thêm cho đủ 5 frames nếu client gửi thiếu
-    while len(frames) < 5:
-        frames.append(torch.zeros(3, 32, 128))
+    # Đệm cho đủ 5 frame nếu thiếu
+    # Nhân bản frame cuối cùng cho đủ 5 frames thay vì nhét ảnh đen
+    if not frames:
+        return {"plate": "", "confidence": 0.0}
+        
+    while len(frames) < 5: 
+        frames.append(frames[-1])
     frames = frames[:5]
         
     X = torch.stack(frames, dim=0).unsqueeze(0).to(device)
     
+    # Dự đoán
     with torch.no_grad():
         logits = o_model(X)
         probs = torch.softmax(logits, dim=-1)
@@ -77,9 +110,13 @@ async def predict_plate(files: List[UploadFile] = File(...)):
             
         raw_p = "".join(out)
         avg_conf = sum(out_c) / max(1, len(out_c)) if out_c else 0.0
+        final_p = apply_layout_pattern(raw_p, layout)
         
-    return {"plate": raw_p, "confidence": round(avg_conf, 4)}
+    return {
+        "plate": final_p, 
+        "raw_text": raw_p,
+        "confidence": round(avg_conf, 4)
+    }
 
 if __name__ == "__main__":
-    # Khởi chạy server ở port 8000
-    uvicorn.run("serve:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("serve:app", host="127.0.0.1", port=8000, reload=True)

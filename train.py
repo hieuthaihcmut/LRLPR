@@ -20,7 +20,7 @@ def main():
         config = yaml.safe_load(f)
 
     # Khởi tạo tracking (để chế độ disabled cho người dùng clone về chạy thử nhanh)
-    wandb.init(project=config['project']['name'], config=config, mode="disabled")
+    wandb.init(project=config['project']['name'], config=config)
     
     # 2. Cấu hình thiết bị
     config_device = config['project'].get('device', 'auto')

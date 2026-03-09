@@ -1,17 +1,17 @@
-# configs/default.yaml
 project:
   name: "lpr-multiframe-ocr"
   work_dir: "./work_dir"
   cache_path: "./work_dir/corners_multidata_cache.json"
   corner_ckpt: "./work_dir/corner_net.pth"
+  device: "auto"
 
 data:
-  manifest_path: "./dataset_manifest.json" # File DVC sinh ra ở bước trước
+  manifest_path: "./dataset_manifest.json"
   img_h: 32
   img_w: 128
 
 model:
-  vocab_size: 37 # <blank> + 10 số + 26 chữ cái
+  vocab_size: 37
   d_model: 256
   nhead: 8
   num_layers: 3
