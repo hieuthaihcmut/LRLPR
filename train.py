@@ -15,33 +15,43 @@ def collate(b):
     return torch.stack([x[0] for x in b]), [x[1] for x in b], [x[2] for x in b], [x[3] for x in b]
 
 def main():
+    # 1. Đọc file cấu hình
     with open("configs/default.yaml", "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
-    # Đã tắt W&B để in log thẳng ra terminal
+    # Khởi tạo tracking (để chế độ disabled cho người dùng clone về chạy thử nhanh)
     wandb.init(project=config['project']['name'], config=config, mode="disabled")
     
+    # 2. Cấu hình thiết bị
     config_device = config['project'].get('device', 'auto')
     if config_device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
         device = torch.device(config_device)
         
-    print(f"🚀 Đang chạy pipeline trên: {device}")
+    print(f"🚀 Bắt đầu quá trình huấn luyện trên thiết bị: {device}")
     
+    # 3. Load file phân chia dữ liệu
+    if not os.path.exists(config['data']['manifest_path']):
+        print(f"❌ Lỗi: Không tìm thấy {config['data']['manifest_path']}. Vui lòng chạy create_manifest.py trước!")
+        return
+        
     with open(config['data']['manifest_path'], "r", encoding="utf-8") as f:
         data_splits = json.load(f)
     tr_tracks, va_tracks = data_splits["train"], data_splits["val"]
     
     print(f"📦 Dữ liệu: {len(tr_tracks)} Train | {len(va_tracks)} Val")
 
+    # 4. Khởi tạo DataLoader
     tr_dataset = MultiFrameOCRDatasetCached(tr_tracks, config['project']['cache_path'], th=config['data']['img_h'], tw=config['data']['img_w'], is_train=True)
     va_dataset = MultiFrameOCRDatasetCached(va_tracks, config['project']['cache_path'], th=config['data']['img_h'], tw=config['data']['img_w'], is_train=False)
     
     tr_loader = DataLoader(tr_dataset, batch_size=config['train']['batch_size'], shuffle=True, num_workers=2, collate_fn=collate)
     va_loader = DataLoader(va_dataset, batch_size=config['train']['batch_size'], shuffle=False, num_workers=2, collate_fn=collate)
 
+    # 5. Khởi tạo Model (Luôn train từ đầu - Train from scratch)
     model = ResTranOCR_Robust(vocab_size, d_model=config['model']['d_model'], nhead=config['model']['nhead'], num_layers=config['model']['num_layers']).to(device)
+    
     opt = torch.optim.AdamW(model.parameters(), lr=config['train']['lr'], weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=config['train']['max_lr'], steps_per_epoch=len(tr_loader), epochs=config['train']['epochs'], pct_start=0.2)
     ctc = nn.CTCLoss(blank=0, zero_infinity=True)
@@ -50,6 +60,9 @@ def main():
     os.makedirs(config['project']['work_dir'], exist_ok=True)
     best_path = os.path.join(config['project']['work_dir'], "best_ocr_model.pth")
     
+    print("✨ Bắt đầu huấn luyện mô hình từ con số 0...")
+    
+    # 6. Vòng lặp huấn luyện
     for ep in range(1, config['train']['epochs'] + 1):
         model.train()
         tl = 0.0
@@ -74,6 +87,7 @@ def main():
             tl += loss.item()
             pbar.set_postfix(loss=loss.item())
 
+        # Vòng lặp đánh giá (Validation)
         model.eval()
         correct, total = 0, 0
         with torch.no_grad():
@@ -89,10 +103,11 @@ def main():
         
         print(f"✅ Ep {ep}: Loss={avg_train_loss:.4f} | VAL ACC={val_acc*100:.2f}%")
         
+        # Lưu model nếu tốt hơn
         if val_acc > best_acc:
             best_acc = val_acc
             torch.save(model.state_dict(), best_path)
-            print(" 💾 Đã lưu model xịn nhất!")
+            print(f" 💾 Đã lưu model xịn nhất tại epoch {ep}!")
 
 if __name__ == "__main__":
     main()
